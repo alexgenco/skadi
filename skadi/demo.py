@@ -1,20 +1,18 @@
 from __future__ import absolute_import
 
+import collections as c
 import copy
-import io
 
-from skadi import stream
 from skadi import index as i
-from skadi.engine import world as w
-from skadi.engine.observer import active_modifier as o_am
-from skadi.index import match as i_m
-from skadi.index import epilogue as i_e
+from skadi.index import full_packet as i_fp
 from skadi.io import bitstream as b_io
 from skadi.io.protobuf import demo as d_io
 from skadi.io.protobuf import packet as p_io
-from skadi.io.unpacker import entity as uent
-from skadi.io.unpacker.entity import PVS
 from skadi.protoc import demo_pb2 as pb_d
+from skadi.io.unpacker import entity as u_ent
+from skadi.io.unpacker import string_table as u_st
+from skadi.engine import world as w
+from skadi.engine.observer import active_modifier as o_am
 from skadi.protoc import netmessages_pb2 as pb_n
 
 
@@ -22,78 +20,153 @@ def construct(*args):
   return Demo(*args)
 
 
-class Demo(object):
-  class Index(i.Index):
-    def __init__(self, iterable):
-      super(Demo.Index, self).__init__(iterable)
+Snapshot = c.namedtuple('Snapshot', [
+  'tick', 'modifiers', 'world'
+])
 
-    @property
-    def match(self):
-      peek, _ = self._stop
-      return i_m.construct(self.find_behind(peek.tell))
 
-    @property
-    def epilogue(self):
-      peek, _ = self._stop
-      return i_e.construct(self.find_ahead(peek.tell))
-
-    @property
-    def _stop(self):
-      return self.find(pb_d.DEM_Stop)
-
-  def __init__(self, prologue, io):
-    self.meta = prologue.meta
-    self.recv_tables = prologue.recv_tables
-    self.string_tables = prologue.string_tables
-    self.game_event_list = prologue.game_event_list
-
+class Stream(object):
+  def __init__(self, io, cb, rt, st, modifiers, world, tick=0):
     self.io = io
-    self.index = Demo.Index(d_io.construct(self.io))
+    self.tick = 0
+    self.class_bits = cb
+    self.recv_tables = rt
+    self.modifiers = st
+    self.string_tables = st
+    self.world = world
+    self._bootstrap_tick = tick
+    self._baseline_cache = {}
+
+    self.bootstrap()
+
+  def __iter__(self):
+    demo_io = d_io.construct(self.io)
+    iter_entries = iter(demo_io)
+
+    def advance():
+      try:
+        peek, message = next(iter_entries)
+
+        if peek.kind == pb_d.DEM_FullPacket:
+          return advance() # skip
+        elif peek.kind == pb_d.DEM_Stop:
+          raise StopIteration()
+
+        pbmsg = d_io.parse(peek.kind, peek.compressed, message)
+        return self.advance(peek.tick, pbmsg)
+      except StopIteration:
+        return None
+
+    return iter(advance, None)
+
+  def bootstrap(self):
+    iter_bootstrap = iter(self)
+
+    while next(iter_bootstrap):
+      if self.tick >= self._bootstrap_tick:
+        return
+
+  def advance(self, tick, pbmsg):
+    self.tick = tick
+
+    st, cb, rt = self.string_tables, self.class_bits, self.recv_tables
+
+    index = i.construct(p_io.construct(pbmsg.data))
+    upd_st = index.find_all(pb_n.svc_UpdateStringTable)
+
+    for _pbmsg in [p_io.parse(p.kind, m) for p, m in upd_st]:
+      key = self.string_tables.keys()[_pbmsg.table_id]
+      _st = self.string_tables[key]
+
+      ne = _pbmsg.num_changed_entries
+      eb, sf, sb = _st.entry_bits, _st.size_fixed, _st.size_bits
+      bs = b_io.construct(_pbmsg.string_data)
+
+      for entry in u_st.unpack(bs, ne, eb, sf, sb):
+        _st.update(entry)
+
+    p, m = index.find(pb_n.svc_PacketEntities)
+    pe = p_io.parse(p.kind, m)
+    ct = pe.updated_entries
+    bs = b_io.construct(pe.entity_data)
+
+    unpacker = u_ent.unpack(bs, -1, ct, False, cb, self.world)
+
+    for index, mode, context in unpacker:
+      if mode & u_ent.PVS.Entering:
+        cls, serial, diff = context
+
+        if cls not in self._baseline_cache:
+          data = st['instancebaseline'].get(cls)[1]
+          bs = b_io.construct(data)
+          unpacker = u_ent.unpack(bs, -1, 1, False, cb, self.world)
+
+          self._baseline_cache[cls] = unpacker.unpack_baseline(rt[cls])
+
+        state = dict(self._baseline_cache[cls])
+        state.update(diff)
+
+        self.world.create(cls, index, serial, state)
+      elif mode & u_ent.PVS.Deleting:
+        self.world.delete(index)
+      elif mode ^ u_ent.PVS.Leaving:
+        state = dict(self.world.find_index(index))
+        state.update(context)
+
+        self.world.update(index, state)
+
+    return Snapshot(self.tick, self.modifiers, self.world)
+
+
+class Demo(object):
+  def __init__(self, prologue, io):
+    self.prologue = prologue
+    self.io = io
 
   def stream(self, tick=0):
-    match = self.index.match
-    cb, rt = self.meta.class_bits, self.recv_tables
-    mm = o_am.construct()
-    st = copy.deepcopy(self.string_tables)
-    st_ib = st['instancebaseline']
+    demo_io = d_io.construct(self.io)
 
-    full_packets = filter(lambda (p, _): p.tick <= tick, match.full_packets)
+    meta, recv_tables, string_tables, game_event_list = self.prologue
+
+    cb = meta.class_bits
+    rt = recv_tables
+    st = copy.deepcopy(string_tables)
+    mm = o_am.construct()
+
+    full_packets = i_fp.construct(demo_io, tick=tick)
+    # update
     for peek, message in full_packets:
       full_packet = d_io.parse(peek.kind, peek.compressed, message)
 
       for table in full_packet.string_table.tables:
         assert not table.items_clientside
 
-        if table.table_name == 'ActiveModifiers':
-          observer = mm
-        else:
-          observer = None
-
         entries = [(_i, e.str, e.data) for _i, e in enumerate(table.items)]
         st[table.table_name].update_all(entries)
 
-    peek, message = full_packets[-1]
-    pbmsg = d_io.parse(peek.kind, peek.compressed, message)
-    packet_index = i.construct(p_io.construct(pbmsg.packet.data))
-
     world = w.construct(rt)
 
-    peek, message = packet_index.find(pb_n.svc_PacketEntities)
-    pe = p_io.parse(peek.kind, message)
-    ct = pe.updated_entries
-    bs = b_io.construct(pe.entity_data)
-    unpacker = uent.unpack(bs, -1, ct, False, cb, world)
+    if full_packets.entries:
+      peek, message = full_packets.entries.items()[-1]
+      pbmsg = d_io.parse(peek.kind, peek.compressed, message)
+      packet = i.construct(p_io.construct(pbmsg.packet.data))
 
-    for index, mode, (cls, serial, diff) in unpacker:
-      data = st['instancebaseline'].get(cls)[1]
-      bs = b_io.construct(data)
-      unpacker = uent.unpack(bs, -1, 1, False, cb, world)
-      state = dict(unpacker.unpack_baseline(rt[cls]))
-      state.update(diff)
+      peek, message = packet.find(pb_n.svc_PacketEntities)
+      pe = p_io.parse(peek.kind, message)
+      ct = pe.updated_entries
+      bs = b_io.construct(pe.entity_data)
+      unpacker = u_ent.unpack(bs, -1, ct, False, cb, world)
 
-      try:
-        world.create(cls, index, serial, state)
-      except AssertionError, e:
-        print e
+      for index, mode, (cls, serial, diff) in unpacker:
+        data = st['instancebaseline'].get(cls)[1]
+        bs = b_io.construct(data)
+        unpacker = u_ent.unpack(bs, -1, 1, False, cb, world)
+        state = dict(unpacker.unpack_baseline(rt[cls]))
+        state.update(diff)
 
-    return stream.construct(self.io, match, tick, cb, rt, st, mm, world)
+        try:
+          world.create(cls, index, serial, state)
+        except AssertionError, e:
+          print e
+
+    return Stream(self.io, cb, rt, st, mm, world, tick=tick)
