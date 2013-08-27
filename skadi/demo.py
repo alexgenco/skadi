@@ -1,10 +1,7 @@
-from __future__ import absolute_import
-
 import collections as c
 import copy
 
 from skadi import index as i
-from skadi.index import full_packet as i_fp
 from skadi.io import bitstream as b_io
 from skadi.io.protobuf import demo as d_io
 from skadi.io.protobuf import packet as p_io
@@ -16,28 +13,26 @@ from skadi.engine.observer import active_modifier as o_am
 from skadi.protoc import netmessages_pb2 as pb_n
 
 
+Snapshot = c.namedtuple('Snapshot', ['tick', 'modifiers', 'world'])
+
+
 def construct(*args):
   return Demo(*args)
 
 
-Snapshot = c.namedtuple('Snapshot', [
-  'tick', 'modifiers', 'world'
-])
-
-
 class Stream(object):
-  def __init__(self, io, cb, rt, st, modifiers, world, tick=0):
+  def __init__(self, io, cb, rt, st, modifiers, world, stragglers=None):
     self.io = io
-    self.tick = 0
     self.class_bits = cb
     self.recv_tables = rt
     self.modifiers = st
     self.string_tables = st
     self.world = world
-    self._bootstrap_tick = tick
     self._baseline_cache = {}
 
-    self.bootstrap()
+    for peek, message in stragglers:
+      pbmsg = d_io.parse(peek.kind, peek.compressed, message)
+      self.advance(peek.tick, pbmsg)
 
   def __iter__(self):
     demo_io = d_io.construct(self.io)
@@ -59,16 +54,7 @@ class Stream(object):
 
     return iter(advance, None)
 
-  def bootstrap(self):
-    iter_bootstrap = iter(self)
-
-    while next(iter_bootstrap):
-      if self.tick >= self._bootstrap_tick:
-        return
-
   def advance(self, tick, pbmsg):
-    self.tick = tick
-
     st, cb, rt = self.string_tables, self.class_bits, self.recv_tables
 
     index = i.construct(p_io.construct(pbmsg.data))
@@ -115,7 +101,7 @@ class Stream(object):
 
         self.world.update(index, state)
 
-    return Snapshot(self.tick, self.modifiers, self.world)
+    return Snapshot(tick, self.modifiers, self.world)
 
 
 class Demo(object):
@@ -133,8 +119,26 @@ class Demo(object):
     st = copy.deepcopy(string_tables)
     mm = o_am.construct()
 
-    full_packets = i_fp.construct(demo_io, tick=tick)
-    # update
+    full_packets, stragglers = [], []
+
+    if tick:
+      iter_bootstrap = iter(demo_io)
+
+      try:
+        while True:
+          p, m = next(iter_bootstrap)
+
+          if p.kind == pb_d.DEM_FullPacket:
+            full_packets.append((p, m))
+            stragglers = []
+          else:
+            stragglers.append((p, m))
+
+          if p.tick > tick:
+            break
+      except StopIteration:
+        return None
+
     for peek, message in full_packets:
       full_packet = d_io.parse(peek.kind, peek.compressed, message)
 
@@ -146,8 +150,8 @@ class Demo(object):
 
     world = w.construct(rt)
 
-    if full_packets.entries:
-      peek, message = full_packets.entries.items()[-1]
+    if full_packets:
+      peek, message = full_packets[-1]
       pbmsg = d_io.parse(peek.kind, peek.compressed, message)
       packet = i.construct(p_io.construct(pbmsg.packet.data))
 
@@ -169,4 +173,4 @@ class Demo(object):
         except AssertionError, e:
           print e
 
-    return Stream(self.io, cb, rt, st, mm, world, tick=tick)
+    return Stream(self.io, cb, rt, st, mm, world, stragglers=stragglers)
